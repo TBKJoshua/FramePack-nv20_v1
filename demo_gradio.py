@@ -10,6 +10,7 @@ import traceback
 import einops
 import safetensors.torch as sf
 import numpy as np
+import time
 import argparse
 import math
 
@@ -38,6 +39,7 @@ print(args)
 
 free_mem_gb = get_cuda_free_memory_gb(gpu)
 high_vram = free_mem_gb > 60
+# high_vram = False  # Force low-VRAM path for testing
 
 print(f'Free VRAM {free_mem_gb} GB')
 print(f'High-VRAM Mode: {high_vram}')
@@ -51,7 +53,7 @@ vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanV
 feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
 image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
 
-transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
+transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.float16).cpu()
 
 vae.eval()
 text_encoder.eval()
@@ -66,7 +68,7 @@ if not high_vram:
 transformer.high_quality_fp32_output_for_inference = True
 print('transformer.high_quality_fp32_output_for_inference = True')
 
-transformer.to(dtype=torch.bfloat16)
+transformer.to(dtype=torch.float16)
 vae.to(dtype=torch.float16)
 image_encoder.to(dtype=torch.float16)
 text_encoder.to(dtype=torch.float16)
@@ -107,11 +109,15 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     try:
         # Clean GPU
         if not high_vram:
+            print(f"[PROFILE] Initial VRAM. Free VRAM: {get_cuda_free_memory_gb(gpu)} GB. Allocated VRAM: {torch.cuda.memory_allocated(gpu)/1024**3:.2f} GB")
             unload_complete_models(
                 text_encoder, text_encoder_2, image_encoder, vae, transformer
             )
 
         # Text encoding
+        if not high_vram:
+            start_time = time.time()
+            print(f"[PROFILE] Text Encoding: Start. Free VRAM: {get_cuda_free_memory_gb(gpu)} GB. Allocated VRAM: {torch.cuda.memory_allocated(gpu)/1024**3:.2f} GB")
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
 
@@ -120,6 +126,10 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             load_model_as_complete(text_encoder_2, target_device=gpu)
 
         llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+
+        if not high_vram:
+            end_time = time.time()
+            print(f"[PROFILE] Text Encoding: End. Duration: {end_time - start_time:.2f} s. Free VRAM: {get_cuda_free_memory_gb(gpu)} GB. Allocated VRAM: {torch.cuda.memory_allocated(gpu)/1024**3:.2f} GB")
 
         if cfg == 1:
             llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
@@ -143,6 +153,9 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
 
         # VAE encoding
+        if not high_vram:
+            start_time = time.time()
+            print(f"[PROFILE] VAE Encoding: Start. Free VRAM: {get_cuda_free_memory_gb(gpu)} GB. Allocated VRAM: {torch.cuda.memory_allocated(gpu)/1024**3:.2f} GB")
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...'))))
 
@@ -151,7 +164,14 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         start_latent = vae_encode(input_image_pt, vae)
 
+        if not high_vram:
+            end_time = time.time()
+            print(f"[PROFILE] VAE Encoding: End. Duration: {end_time - start_time:.2f} s. Free VRAM: {get_cuda_free_memory_gb(gpu)} GB. Allocated VRAM: {torch.cuda.memory_allocated(gpu)/1024**3:.2f} GB")
+
         # CLIP Vision
+        if not high_vram:
+            start_time = time.time()
+            print(f"[PROFILE] CLIP Vision Encoding: Start. Free VRAM: {get_cuda_free_memory_gb(gpu)} GB. Allocated VRAM: {torch.cuda.memory_allocated(gpu)/1024**3:.2f} GB")
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
 
@@ -159,7 +179,23 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             load_model_as_complete(image_encoder, target_device=gpu)
 
         image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
+
+        if not high_vram:
+            end_time = time.time()
+            print(f"[PROFILE] CLIP Vision Encoding: End. Duration: {end_time - start_time:.2f} s. Free VRAM: {get_cuda_free_memory_gb(gpu)} GB. Allocated VRAM: {torch.cuda.memory_allocated(gpu)/1024**3:.2f} GB")
         image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
+
+        if not high_vram:
+            start_time_offload_encoders = time.time()
+            print(f"[PROFILE] Offloading Encoders to CPU: Start. Free VRAM: {get_cuda_free_memory_gb(gpu)} GB. Allocated VRAM: {torch.cuda.memory_allocated(gpu)/1024**3:.2f} GB")
+            text_encoder.to(cpu)
+            text_encoder_2.to(cpu)
+            image_encoder.to(cpu)
+            # No need to manually remove from gpu_complete_modules if using DynamicSwapInstaller,
+            # as .to(cpu) changes their effective device.
+            # unload_complete_models() called at the start of the loop will handle VAE/Transformer.
+            end_time_offload_encoders = time.time()
+            print(f"[PROFILE] Offloading Encoders to CPU: End. Duration: {end_time_offload_encoders - start_time_offload_encoders:.2f} s. Free VRAM: {get_cuda_free_memory_gb(gpu)} GB. Allocated VRAM: {torch.cuda.memory_allocated(gpu)/1024**3:.2f} GB")
 
         # Dtype
 
@@ -208,8 +244,17 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
 
             if not high_vram:
+                start_time_unload = time.time()
+                print(f"[PROFILE] Sampling Loop - unload_complete_models: Start. Free VRAM: {get_cuda_free_memory_gb(gpu)} GB. Allocated VRAM: {torch.cuda.memory_allocated(gpu)/1024**3:.2f} GB")
                 unload_complete_models()
+                end_time_unload = time.time()
+                print(f"[PROFILE] Sampling Loop - unload_complete_models: End. Duration: {end_time_unload - start_time_unload:.2f} s. Free VRAM: {get_cuda_free_memory_gb(gpu)} GB. Allocated VRAM: {torch.cuda.memory_allocated(gpu)/1024**3:.2f} GB")
+
+                start_time_move_transformer = time.time()
+                print(f"[PROFILE] Sampling Loop - move_model_to_device_with_memory_preservation(transformer): Start. Free VRAM: {get_cuda_free_memory_gb(gpu)} GB. Allocated VRAM: {torch.cuda.memory_allocated(gpu)/1024**3:.2f} GB")
                 move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
+                end_time_move_transformer = time.time()
+                print(f"[PROFILE] Sampling Loop - move_model_to_device_with_memory_preservation(transformer): End. Duration: {end_time_move_transformer - start_time_move_transformer:.2f} s. Free VRAM: {get_cuda_free_memory_gb(gpu)} GB. Allocated VRAM: {torch.cuda.memory_allocated(gpu)/1024**3:.2f} GB")
 
             if use_teacache:
                 transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
@@ -234,6 +279,10 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
                 return
 
+            if not high_vram:
+                start_time_sample = time.time()
+                print(f"[PROFILE] Sampling Loop - sample_hunyuan: Start. Free VRAM: {get_cuda_free_memory_gb(gpu)} GB. Allocated VRAM: {torch.cuda.memory_allocated(gpu)/1024**3:.2f} GB")
+
             generated_latents = sample_hunyuan(
                 transformer=transformer,
                 sampler='unipc',
@@ -253,7 +302,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 negative_prompt_embeds_mask=llama_attention_mask_n,
                 negative_prompt_poolers=clip_l_pooler_n,
                 device=gpu,
-                dtype=torch.bfloat16,
+                dtype=torch.float16,
                 image_embeddings=image_encoder_last_hidden_state,
                 latent_indices=latent_indices,
                 clean_latents=clean_latents,
@@ -265,6 +314,10 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 callback=callback,
             )
 
+            if not high_vram:
+                end_time_sample = time.time()
+                print(f"[PROFILE] Sampling Loop - sample_hunyuan: End. Duration: {end_time_sample - start_time_sample:.2f} s. Free VRAM: {get_cuda_free_memory_gb(gpu)} GB. Allocated VRAM: {torch.cuda.memory_allocated(gpu)/1024**3:.2f} GB")
+
             if is_last_section:
                 generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
 
@@ -272,10 +325,23 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
 
             if not high_vram:
+                start_time_offload_transformer = time.time()
+                print(f"[PROFILE] Sampling Loop - offload_model_from_device_for_memory_preservation(transformer): Start. Free VRAM: {get_cuda_free_memory_gb(gpu)} GB. Allocated VRAM: {torch.cuda.memory_allocated(gpu)/1024**3:.2f} GB")
                 offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
+                end_time_offload_transformer = time.time()
+                print(f"[PROFILE] Sampling Loop - offload_model_from_device_for_memory_preservation(transformer): End. Duration: {end_time_offload_transformer - start_time_offload_transformer:.2f} s. Free VRAM: {get_cuda_free_memory_gb(gpu)} GB. Allocated VRAM: {torch.cuda.memory_allocated(gpu)/1024**3:.2f} GB")
+
+                start_time_load_vae = time.time()
+                print(f"[PROFILE] Sampling Loop - load_model_as_complete(vae): Start. Free VRAM: {get_cuda_free_memory_gb(gpu)} GB. Allocated VRAM: {torch.cuda.memory_allocated(gpu)/1024**3:.2f} GB")
                 load_model_as_complete(vae, target_device=gpu)
+                end_time_load_vae = time.time()
+                print(f"[PROFILE] Sampling Loop - load_model_as_complete(vae): End. Duration: {end_time_load_vae - start_time_load_vae:.2f} s. Free VRAM: {get_cuda_free_memory_gb(gpu)} GB. Allocated VRAM: {torch.cuda.memory_allocated(gpu)/1024**3:.2f} GB")
 
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
+
+            if not high_vram:
+                start_time_vae_decode = time.time()
+                print(f"[PROFILE] Sampling Loop - vae_decode: Start. Free VRAM: {get_cuda_free_memory_gb(gpu)} GB. Allocated VRAM: {torch.cuda.memory_allocated(gpu)/1024**3:.2f} GB")
 
             if history_pixels is None:
                 history_pixels = vae_decode(real_history_latents, vae).cpu()
@@ -287,6 +353,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
 
             if not high_vram:
+                end_time_vae_decode = time.time()
+                print(f"[PROFILE] Sampling Loop - vae_decode: End. Duration: {end_time_vae_decode - start_time_vae_decode:.2f} s. Free VRAM: {get_cuda_free_memory_gb(gpu)} GB. Allocated VRAM: {torch.cuda.memory_allocated(gpu)/1024**3:.2f} GB")
                 unload_complete_models()
 
             output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
