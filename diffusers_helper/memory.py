@@ -104,21 +104,26 @@ def move_model_to_device_with_memory_preservation(model, target_device, preserve
             print(f'[DETAIL LOG]    - Module {m.__class__.__name__} weight device: {m.weight.device}')
             
             current_free_vram_before_move = get_cuda_free_memory_gb(target_device)
-            if current_free_vram_before_move <= preserved_memory_gb:
-                # Log condition met (VRAM <= Preserved)
-                print(f'[DETAIL LOG]    - Condition met (Free VRAM {current_free_vram_before_move:.2f}GB <= Preserved {preserved_memory_gb}GB). Moving {m.__class__.__name__} to {target_device}')
-                m.to(device=target_device)
+            # Inverted condition: move only if free VRAM is GREATER than preserved.
+            if current_free_vram_before_move > preserved_memory_gb:
+                print(f'[DETAIL LOG]    - Condition met (Free VRAM {current_free_vram_before_move:.2f}GB > Preserved {preserved_memory_gb}GB). Attempting to move {m.__class__.__name__} to {target_device}')
+                try:
+                    m.to(device=target_device)
+                except Exception as e_module_move: # Can be torch.cuda.OutOfMemoryError if more specific catch is needed
+                    print(f'[DETAIL LOG]    - ERROR moving module {m.__class__.__name__} to {target_device}: {e_module_move}')
+                    print(f'[DETAIL LOG]    - Breaking loop due to error during module move.')
+                    break # Stop further processing if a module fails to move
             else:
-                # Log condition NOT met (VRAM > Preserved) and SKIPPING the move for this module.
-                print(f'[DETAIL LOG]    - Condition NOT met (Free VRAM {current_free_vram_before_move:.2f}GB > Preserved {preserved_memory_gb}GB). Skipping move for {m.__class__.__name__}')
-                # IMPORTANT: No m.to(device=target_device) here, to match the log.
+                # Condition NOT met (VRAM <= Preserved), so skip and break.
+                print(f'[DETAIL LOG]    - Condition NOT met (Free VRAM {current_free_vram_before_move:.2f}GB <= Preserved {preserved_memory_gb}GB). Skipping move for {m.__class__.__name__} and stopping further GPU loading.')
+                break # Stop processing further modules
         else:
             # Log non-parameter module
             print(f'[DETAIL LOG]    - Module {m.__class__.__name__} has no weight attribute or weight is None, skipping direct move.')
 
-    # Log after loop, before model.to()
-    print(f'[DETAIL LOG]  Finished module iteration. Current Free VRAM: {get_cuda_free_memory_gb(target_device):.2f}GB. Now calling model.to({target_device}).')
-    model.to(device=target_device)
+    # Log after loop. The aggressive model.to() is removed.
+    print(f'[DETAIL LOG]  Finished module iteration. Current Free VRAM: {get_cuda_free_memory_gb(target_device):.2f}GB.')
+    # model.to(device=target_device) # This line is REMOVED as per instructions
     torch.cuda.empty_cache()
     # Exit log
     print(f'[DETAIL LOG] Exit move_model_to_device_with_memory_preservation for {model.__class__.__name__}. Final Free VRAM: {get_cuda_free_memory_gb(target_device):.2f}GB')
@@ -126,18 +131,60 @@ def move_model_to_device_with_memory_preservation(model, target_device, preserve
 
 
 def offload_model_from_device_for_memory_preservation(model, target_device, preserved_memory_gb=0):
-    print(f'Offloading {model.__class__.__name__} from {target_device} to preserve memory: {preserved_memory_gb} GB')
+    initial_free_vram = get_cuda_free_memory_gb(target_device)
+    print(f'[DETAIL OFFLOAD LOG] Enter offload_model_from_device_for_memory_preservation for {model.__class__.__name__}. Target device for offload checks: {target_device}. Preserved Mem Target: {preserved_memory_gb}GB. Initial Free VRAM: {initial_free_vram:.2f}GB')
+    # Original print, can be kept or removed.
+    # print(f'Offloading {model.__class__.__name__} from {target_device} to preserve memory: {preserved_memory_gb} GB')
 
-    for m in model.modules():
+    if initial_free_vram >= preserved_memory_gb:
+        print(f'[DETAIL OFFLOAD LOG] Initial VRAM ({initial_free_vram:.2f}GB) already meets or exceeds target ({preserved_memory_gb}GB). No offload needed. Exiting early.')
+        torch.cuda.empty_cache()
+        print(f'[DETAIL OFFLOAD LOG] Exit offload_model_from_device_for_memory_preservation for {model.__class__.__name__}. Final Free VRAM: {get_cuda_free_memory_gb(target_device):.2f}GB')
+        return
+
+    for m_idx, m in enumerate(model.modules()):
+        print(f'[DETAIL OFFLOAD LOG]  - Processing module ({m_idx+1}): {m.__class__.__name__}')
+
+        if hasattr(m, 'weight') and m.weight is not None:
+            print(f'[DETAIL OFFLOAD LOG]    - Module {m.__class__.__name__} weight device: {m.weight.device}')
+            if m.weight.device == target_device:
+                current_free_gb = get_cuda_free_memory_gb(target_device)
+                if current_free_gb < preserved_memory_gb:
+                    print(f'[DETAIL OFFLOAD LOG]      - Condition met (Free VRAM {current_free_gb:.2f}GB < Preserved {preserved_memory_gb}GB). Offloading {m.__class__.__name__} from {target_device} to cpu.')
+                    try:
+                        m.to(device=cpu)
+                    except Exception as e_offload_module:
+                        print(f'[DETAIL OFFLOAD LOG]      - ERROR offloading module {m.__class__.__name__}: {e_offload_module}')
+                else:
+                    print(f'[DETAIL OFFLOAD LOG]      - Condition NOT met (Free VRAM {current_free_gb:.2f}GB >= Preserved {preserved_memory_gb}GB). Module {m.__class__.__name__} remains on {target_device}. Stopping further module-level offload attempts as target met.')
+                    # If the target is met, we should stop trying to offload more modules one by one.
+                    # The main function-level check at the start handles cases where VRAM is already sufficient.
+                    # This break ensures we don't continue looping if partial offload meets the target.
+                    break 
+            else:
+                print(f'[DETAIL OFFLOAD LOG]    - Module {m.__class__.__name__} is not on {target_device} (actual: {m.weight.device}), skipping offload.')
+        else:
+            print(f'[DETAIL OFFLOAD LOG]    - Module {m.__class__.__name__} has no weight attribute or weight is None, skipping direct offload.')
+        
+        # Check VRAM again after potential offload; if target met, exit loop.
+        # This is similar to the original function's loop-level check.
         if get_cuda_free_memory_gb(target_device) >= preserved_memory_gb:
-            torch.cuda.empty_cache()
-            return
+            print(f'[DETAIL OFFLOAD LOG]  VRAM target ({preserved_memory_gb}GB) met after processing module {m.__class__.__name__}. Current Free VRAM: {get_cuda_free_memory_gb(target_device):.2f}GB. Stopping module loop.')
+            break
 
-        if hasattr(m, 'weight'):
-            m.to(device=cpu)
-
-    model.to(device=cpu)
+    # This part is reached if the loop completes and VRAM target might still not be met.
+    final_check_free_vram = get_cuda_free_memory_gb(target_device)
+    if final_check_free_vram < preserved_memory_gb:
+        print(f'[DETAIL OFFLOAD LOG]  Finished module iteration. Free VRAM ({final_check_free_vram:.2f}GB) still below target ({preserved_memory_gb}GB). Attempting full model.to(cpu).')
+        try:
+            model.to(device=cpu)
+        except Exception as e_offload_full:
+            print(f'[DETAIL OFFLOAD LOG]  ERROR during full model.to(cpu): {e_offload_full}')
+    else:
+        print(f'[DETAIL OFFLOAD LOG]  Finished module iteration. Free VRAM ({final_check_free_vram:.2f}GB) meets or exceeds target ({preserved_memory_gb}GB). Full model.to(cpu) not needed.')
+        
     torch.cuda.empty_cache()
+    print(f'[DETAIL OFFLOAD LOG] Exit offload_model_from_device_for_memory_preservation for {model.__class__.__name__}. Final Free VRAM: {get_cuda_free_memory_gb(target_device):.2f}GB')
     return
 
 
