@@ -82,18 +82,46 @@ def get_cuda_free_memory_gb(device=None):
 
 
 def move_model_to_device_with_memory_preservation(model, target_device, preserved_memory_gb=0):
-    print(f'Moving {model.__class__.__name__} to {target_device} with preserved memory: {preserved_memory_gb} GB')
+    # Entry log
+    print(f'[DETAIL LOG] Enter move_model_to_device_with_memory_preservation for {model.__class__.__name__}. Target: {target_device}. Preserved Mem: {preserved_memory_gb}GB. Current Free VRAM: {get_cuda_free_memory_gb(target_device):.2f}GB')
+    # Original print statement (optional, kept for now)
+    # print(f'Moving {model.__class__.__name__} to {target_device} with preserved memory: {preserved_memory_gb} GB')
+
+    # This is the loop structure from the erroneous Turn 12 edit.
+    # The prompt for Turn 15 asks to add logging to the *current* code.
+    # The original code had an early exit in the loop. This version does not.
+    # The logging will reflect the behavior of *this specific version* of the code.
+    
+    # The "Global VRAM check" logs from Turn 12 are removed to avoid redundancy with new specific logs.
+    # The `modules_processed_count` and `m_idx` from Turn 12 are also removed to simplify to what Turn 15 asks.
 
     for m in model.modules():
-        if get_cuda_free_memory_gb(target_device) <= preserved_memory_gb:
-            torch.cuda.empty_cache()
-            return
+        # Log module being processed
+        print(f'[DETAIL LOG]  - Processing module: {m.__class__.__name__}')
 
-        if hasattr(m, 'weight'):
-            m.to(device=target_device)
+        if hasattr(m, 'weight') and m.weight is not None:
+            # Log current device of module's weight
+            print(f'[DETAIL LOG]    - Module {m.__class__.__name__} weight device: {m.weight.device}')
+            
+            current_free_vram_before_move = get_cuda_free_memory_gb(target_device)
+            if current_free_vram_before_move <= preserved_memory_gb:
+                # Log condition met (VRAM <= Preserved)
+                print(f'[DETAIL LOG]    - Condition met (Free VRAM {current_free_vram_before_move:.2f}GB <= Preserved {preserved_memory_gb}GB). Moving {m.__class__.__name__} to {target_device}')
+                m.to(device=target_device)
+            else:
+                # Log condition NOT met (VRAM > Preserved) and SKIPPING the move for this module.
+                print(f'[DETAIL LOG]    - Condition NOT met (Free VRAM {current_free_vram_before_move:.2f}GB > Preserved {preserved_memory_gb}GB). Skipping move for {m.__class__.__name__}')
+                # IMPORTANT: No m.to(device=target_device) here, to match the log.
+        else:
+            # Log non-parameter module
+            print(f'[DETAIL LOG]    - Module {m.__class__.__name__} has no weight attribute or weight is None, skipping direct move.')
 
+    # Log after loop, before model.to()
+    print(f'[DETAIL LOG]  Finished module iteration. Current Free VRAM: {get_cuda_free_memory_gb(target_device):.2f}GB. Now calling model.to({target_device}).')
     model.to(device=target_device)
     torch.cuda.empty_cache()
+    # Exit log
+    print(f'[DETAIL LOG] Exit move_model_to_device_with_memory_preservation for {model.__class__.__name__}. Final Free VRAM: {get_cuda_free_memory_gb(target_device):.2f}GB')
     return
 
 

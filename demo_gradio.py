@@ -82,8 +82,11 @@ transformer.requires_grad_(False)
 
 if not high_vram:
     # DynamicSwapInstaller is same as huggingface's enable_sequential_offload but 3x faster
-    DynamicSwapInstaller.install_model(transformer, device=gpu)
+    # Temporarily disabling DynamicSwapInstaller for the transformer to isolate issues.
+    # DynamicSwapInstaller.install_model(transformer, device=gpu)
     DynamicSwapInstaller.install_model(text_encoder, device=gpu)
+    # Ensure transformer is on CPU initially if not handled by DynamicSwapInstaller
+    transformer.cpu()
 else:
     text_encoder.to(gpu)
     text_encoder_2.to(gpu)
@@ -103,6 +106,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
     job_id = generate_timestamp()
+    # Ensure traceback is imported (it's at the top of the file, this is a reminder)
+    # import traceback 
 
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
@@ -230,8 +235,9 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             latent_padding_size = latent_padding * latent_window_size
 
             if stream.input_queue.top() == 'end':
-                stream.output_queue.push(('end', None))
-                return
+                print("User initiated end of process from sampling loop.")
+                stream.output_queue.push(('end', None)) # Signal UI early
+                return # Exit worker if user ended
 
             print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}')
 
@@ -367,16 +373,51 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             if is_last_section:
                 break
-    except:
+        
+        # Normal completion of the loop
+        print("Worker function processing completed normally (before finally block).")
+
+    except Exception as e_main: # Catch-all for the entire worker function
+        print(f"ERROR in worker function: {type(e_main).__name__} - {str(e_main)}")
         traceback.print_exc()
-
-        if not high_vram:
-            unload_complete_models(
-                text_encoder, text_encoder_2, image_encoder, vae, transformer
-            )
-
-    stream.output_queue.push(('end', None))
-    return
+        # Try to inform the UI about the error
+        error_message_html = f"<p style='color:red;'>Error: {type(e_main).__name__} - {str(e_main)}</p>"
+        # Check if stream and output_queue are available before pushing
+        if stream and hasattr(stream, 'output_queue') and hasattr(stream.output_queue, 'push'):
+            try:
+                stream.output_queue.push(('progress', (None, 'Error Occurred', error_message_html)))
+            except Exception as e_stream:
+                print(f"Failed to push error to UI stream: {type(e_stream).__name__} - {str(e_stream)}")
+        else:
+            print("Stream or output_queue not available for sending error to UI.")
+            
+    finally:
+        # Ensure models are cleaned up from GPU as much as possible
+        if not high_vram: 
+            print("Ensuring models are unloaded in finally block...")
+            # Check if models are defined before attempting to unload
+            # This guards against errors if the worker fails before model initialization
+            # (though in this script, they are defined globally)
+            try:
+                unload_complete_models(
+                    text_encoder, text_encoder_2, image_encoder, vae, transformer
+                )
+            except NameError as ne:
+                print(f"Could not unload models in finally block as some were not defined: {ne}")
+            except Exception as e_unload:
+                print(f"Error during model unloading in finally block: {type(e_unload).__name__} - {str(e_unload)}")
+        
+        # Always push 'end' to signal UI processing is finished, regardless of success or failure.
+        print("Pushing 'end' signal to UI in finally block.")
+        if stream and hasattr(stream, 'output_queue') and hasattr(stream.output_queue, 'push'):
+            try:
+                stream.output_queue.push(('end', None))
+            except Exception as e_stream_final:
+                print(f"Failed to push final 'end' to UI stream: {type(e_stream_final).__name__} - {str(e_stream_final)}")
+        else:
+            print("Stream or output_queue not available for sending final 'end' to UI.")
+            
+    return # Explicit return from worker
 
 
 def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache):
